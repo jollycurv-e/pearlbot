@@ -1,0 +1,15 @@
+hub_url = "ws://localhost:8001"
+hub_api_key = "your_api_key_here"
+
+[[slots]]
+number = 1
+account = "your_alt_account"
+auth = "offline"   # or "microsoft"
+server = "play.example.net"
+port = 25565
+# UUIDs only — not usernames. Get from namemc.com or /data get entity @s UUID in-game
+whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
+
+[[slots.chambers]]
+player = "550e8400-e29b-41d4-a716-446655440000"
+trapdoor = [1234, 64, -5678]

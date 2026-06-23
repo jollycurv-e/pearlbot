@@ -1,86 +1,84 @@
-use std::{fs::OpenOptions, path::PathBuf};
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::{fs, path::Path};
 
-use anyhow::Result;
-use dotenvy_macro::dotenv;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-pub struct Coordinates {
-    pub x: i32,
-    pub y: i32,
-    pub z: i32,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub online: bool,
+    pub hub_url: String,
+    pub hub_api_key: String,
+    #[serde(default)]
+    pub slots: Vec<SlotConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SlotConfig {
+    pub number: u8,
     pub account: String,
-    pub address: String,
-    pub discord_channel: String,
-    pub discord_token: String,
-    pub discord_webhook: String,
-    pub bed: Coordinates,
-    pub pearl: Coordinates,
-    pub bots: Vec<String>,
-    pub passphrases: Vec<String>,
+    pub auth: AuthMode,
+    pub server: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    #[serde(default)]
+    pub chambers: Vec<ChamberConfig>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            online: true,
-            account: dotenv!("ACCOUNT").into(),
-            address: dotenv!("ADDRESS").into(),
-            discord_channel: dotenv!("DISCORD_CHANNEL").into(),
-            discord_token: dotenv!("DISCORD_TOKEN").into(),
-            discord_webhook: dotenv!("DISCORD_WEBHOOK").into(),
-            bed: Default::default(),
-            pearl: Default::default(),
-            bots: Default::default(),
-            passphrases: vec!["AAA===".into()],
-        }
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    Offline,
+    Microsoft,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChamberConfig {
+    pub player: String,
+    pub trapdoor: [i32; 3],
+}
+
+impl SlotConfig {
+    pub fn is_whitelisted(&self, uuid: &str) -> bool {
+        self.whitelist.iter().any(|w| w.eq_ignore_ascii_case(uuid))
+    }
+
+    pub fn find_trapdoor(&self, uuid: &str) -> Option<[i32; 3]> {
+        self.chambers
+            .iter()
+            .find(|c| c.player.eq_ignore_ascii_case(uuid))
+            .map(|c| c.trapdoor)
     }
 }
 
-impl Config {
-    pub fn get_path() -> Result<PathBuf> {
-        let mut config_path = std::env::current_exe()?;
+fn default_port() -> u16 {
+    25565
+}
 
-        config_path.set_file_name("config");
-        config_path.set_extension("json");
+pub fn load(path: &str) -> Result<Config> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading {path}"))?;
+    toml::from_str(&text).with_context(|| format!("parsing {path}"))
+}
 
-        Ok(config_path)
+pub fn write_example(path: &str) -> Result<()> {
+    if Path::new(path).exists() {
+        return Ok(());
     }
+    let example = r#"hub_url = "ws://localhost:8001"
+hub_api_key = "your_api_key_here"
 
-    pub fn load() -> Result<Self> {
-        let config_path = Self::get_path()?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(config_path)?;
+[[slots]]
+number = 1
+account = "your_alt_account"
+auth = "offline"   # or "microsoft"
+server = "play.refinedvanilla.net"
+port = 25565
+# UUIDs (not usernames) — copy from namemc.com or /data get entity @s UUID
+whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
 
-        match serde_json::from_reader(&file) {
-            Ok(config) => Ok(config),
-            Err(_) => {
-                let config = Config::default();
-                serde_json::to_writer_pretty(&file, &config)?;
-
-                Ok(config)
-            }
-        }
-    }
-
-    pub fn save(&mut self) -> Result<()> {
-        let config_path = Self::get_path()?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(config_path)?;
-
-        serde_json::to_writer_pretty(&file, &self)?;
-
-        Ok(())
-    }
+[[slots.chambers]]
+player = "550e8400-e29b-41d4-a716-446655440000"
+trapdoor = [1234, 64, -5678]
+"#;
+    fs::write(path, example).with_context(|| format!("writing {path}"))
 }

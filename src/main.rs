@@ -1,76 +1,170 @@
-#![feature(exclusive_range_pattern)]
+mod config;
+mod hub;
+mod pearl;
 
-use std::{thread::sleep, time::Duration};
+use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
-use azalea::{prelude::*, JoinError, StartError};
-use regex::Regex;
-use serenity::prelude::GatewayIntents;
+use hub::{HubClient, HubEvent, PearlResult};
+use tracing::{debug, error, info, warn};
 
-use crate::{commands::prelude::*, discord::Handler, event::handle, state::State};
+const CONFIG_PATH: &str = "pearlbot.toml";
 
-mod commands;
+// Windows default stack is 1MB vs Linux's 8MB; Azalea needs more.
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run)?
+        .join()
+        .unwrap()
+}
 
-mod chat;
-mod config;
-mod discord;
-mod event;
-mod ncr;
-mod packet;
-mod state;
+#[tokio::main(flavor = "current_thread")]
+async fn run() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "debug".into()),
+        )
+        .init();
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    config::write_example(CONFIG_PATH)?;
+    let cfg = config::load(CONFIG_PATH)?;
 
-    let state = State::default();
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
-    let token = &state.config.lock().unwrap().discord_token.clone();
-    let mut discord = serenity::Client::builder(token, intents)
-        .event_handler(Handler)
-        .await?;
+    info!("Loaded {} slot(s)", cfg.slots.len());
 
-    {
-        let mut data = discord.data.write().await;
-        data.insert::<State>(state.clone());
-    }
+    // Per-slot busy flag
+    let busy: HashMap<u8, Arc<AtomicBool>> = cfg
+        .slots
+        .iter()
+        .map(|s| (s.number, Arc::new(AtomicBool::new(false))))
+        .collect();
 
-    tokio::spawn(async move {
-        discord
-            .start()
-            .await
-            .expect("Failed to start Discord client");
-    });
+    let slot_map: HashMap<u8, _> = cfg
+        .slots
+        .iter()
+        .map(|s| (s.number, s.clone()))
+        .collect();
+
+    info!("Connecting to Hub at {}", cfg.hub_url);
+    let hub = HubClient::connect(cfg.hub_url.clone(), cfg.hub_api_key.clone()).await?;
+    let mut events = hub.subscribe();
+
+    info!("Pearlbot running. Waiting for requests...");
 
     loop {
-        let config = state.config.lock().unwrap().clone();
-        let account = if config.online {
-            Account::microsoft(&config.account).await?
-        } else {
-            Account::offline("ShaysBot")
-        };
-
-        if let Err(error) = ClientBuilder::new()
-            .set_handler(handle)
-            .set_state(state.clone())
-            .start(account, config.address.as_str())
-            .await
-        {
-            eprintln!("{error:?}");
-
-            // Parse N00bBot Proxy abuse timeout
-            let mut duration = Duration::from_secs(15);
-            if let StartError::Join(JoinError::Disconnect { reason }) = error {
-                let regex = Regex::new(r"(\d+\.\d+)s").unwrap();
-                if let Some(captures) = regex.captures(&reason.to_ansi()) {
-                    if let Ok(seconds) = captures[1].parse::<f64>() {
-                        duration = Duration::from_secs_f64(seconds);
-                    }
-                }
+        let event = match events.recv().await {
+            Ok(e) => e,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!("Dropped {n} Hub events (lagged)");
+                continue;
             }
-
-            println!("Re-connecting in {duration:?} seconds");
-            sleep(duration);
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                error!("Hub event channel closed — reconnecting");
+                // Re-subscribe after short wait; the WS task reconnects automatically
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                events = hub.subscribe();
+                continue;
+            }
         };
+
+        match event {
+            HubEvent::Open => info!("Hub WS connected"),
+            HubEvent::Close(reason) => warn!("Hub WS: {reason}"),
+            HubEvent::Error(e) => error!("Hub WS error: {e}"),
+            HubEvent::Unknown(msg) => tracing::trace!("Hub unknown: {msg}"),
+            HubEvent::PearlRequest(req) => {
+                let req_start = Instant::now();
+                info!("PearlRequest received: slot={} requester={} uuid={}",
+                    req.slot, req.requester, req.requester_uuid);
+
+                let Some(slot) = slot_map.get(&req.slot) else {
+                    warn!("Slot {} not configured — rejecting", req.slot);
+                    hub.send_pearl_result(PearlResult {
+                        slot: req.slot,
+                        success: false,
+                        message: format!("Slot {} is not configured", req.slot),
+                        requester: req.requester,
+                    }).ok();
+                    continue;
+                };
+                debug!("Slot {} found: server={} account={}", req.slot, slot.server, slot.account);
+
+                if !slot.is_whitelisted(&req.requester_uuid) {
+                    warn!("{} ({}) not whitelisted for slot {}", req.requester, req.requester_uuid, req.slot);
+                    hub.send_pearl_result(PearlResult {
+                        slot: req.slot,
+                        success: false,
+                        message: format!("{} is not whitelisted", req.requester),
+                        requester: req.requester,
+                    }).ok();
+                    continue;
+                }
+                debug!("{} ({}) is whitelisted", req.requester, req.requester_uuid);
+
+                let Some(trapdoor) = slot.find_trapdoor(&req.requester_uuid) else {
+                    warn!("No chamber for {} ({}) on slot {}", req.requester, req.requester_uuid, req.slot);
+                    hub.send_pearl_result(PearlResult {
+                        slot: req.slot,
+                        success: false,
+                        message: format!("No chamber configured for {}", req.requester),
+                        requester: req.requester,
+                    }).ok();
+                    continue;
+                };
+                debug!("Chamber found: trapdoor={:?}", trapdoor);
+
+                let slot_busy = busy.get(&req.slot).expect("slot in busy map");
+                if slot_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+                    warn!("Slot {} busy — rejecting {}", req.slot, req.requester);
+                    hub.send_pearl_result(PearlResult {
+                        slot: req.slot,
+                        success: false,
+                        message: format!("Slot {} is busy, try again shortly", req.slot),
+                        requester: req.requester,
+                    }).ok();
+                    continue;
+                }
+                info!("Slot {} acquired — spawning pearl task for {} elapsed={:.1}ms",
+                    req.slot, req.requester, req_start.elapsed().as_secs_f32() * 1000.0);
+
+                let slot_clone = slot.clone();
+                let requester = req.requester.clone();
+                let hub_clone = hub.clone();
+                let busy_flag = slot_busy.clone();
+                let slot_num = req.slot;
+
+                tokio::spawn(async move {
+                    let task_start = Instant::now();
+                    debug!("Pearl task started for {requester} slot={slot_num}");
+
+                    let success = pearl::run_pearl(&slot_clone, &requester, trapdoor).await;
+
+                    let elapsed = task_start.elapsed();
+                    info!("Pearl task done — slot={slot_num} success={success} requester={requester} elapsed={:.1}s",
+                        elapsed.as_secs_f32());
+
+                    busy_flag.store(false, Ordering::Relaxed);
+                    debug!("Slot {slot_num} busy flag released");
+
+                    let message = if success {
+                        format!("Pearl pulled for {requester}")
+                    } else {
+                        format!("Pearl failed for {requester}")
+                    };
+
+                    if let Err(e) = hub_clone.send_pearl_result(PearlResult {
+                        slot: slot_num,
+                        success,
+                        message,
+                        requester: requester.clone(),
+                    }) {
+                        error!("Failed to send pearl_result for {requester}: {e}");
+                    }
+                });
+            }
+        }
     }
 }

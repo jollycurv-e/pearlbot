@@ -1,56 +1,17 @@
 [package]
-name = "shaysbot"
-version = "0.0.0"
-authors = ["Shayne Hartford <shaybox@shaybox.com>"]
-edition = "2021"
-description = "My personal Minecraft bot"
-readme = "README.md"
-repository = "https://github.com/ShayBox/ShaysBot"
-license = "MIT"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+name = "pearlbot"
+version = "0.1.0"
+edition = "2024"
+description = "Stasis chamber activation bot for RefinedVanilla"
 
 [dependencies]
-anyhow = "1.0"
-async-trait = "0.1"
-azalea = { git = "https://github.com/mat-1/azalea.git", branch = "1.19.2" }
-azalea-protocol = { git = "https://github.com/mat-1/azalea.git", branch = "1.19.2" }
-base64 = "0.21"
-crossbeam = "0.8"
-dotenvy_macro = "0.15"
-dyn-clonable = "0.9"
-ncr-crypto = "0.2"
-rand = "0.8"
-regex = "1.8"
-reqwest = "0.11"
-serde = "1.0"
-serde_json = "1.0"
-serenity = { version = "0.11", default-features = false, features = [
-    "builder",
-    "cache",
-    "chrono",
-    "client",
-    "gateway",
-    "http",
-    "model",
-    "rustls_backend",
-    "utils",
-] }
-tokio = "1.28"
-tracing-subscriber = "0.3"
-
-[target.'cfg(unix)'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-
-[profile.dev]
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 3
-
-# https://github.com/johnthagen/min-sized-rust
-[profile.release]
-strip = true      # Automatically strip symbols from the binary.
-opt-level = "z"   # Optimize for size.
-lto = true
-codegen-units = 1
+anyhow = "1"
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "ddef37118448b639ff56b86ae339e8913cb4ed11" }
+futures-util = "0.3.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52.1", features = ["fs", "macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
