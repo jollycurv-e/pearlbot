@@ -22,7 +22,6 @@ use tracing::{debug, info, warn, error};
 
 use crate::config::{AuthMode, SlotConfig};
 
-const CLICK_TICKS: u32 = 40;    // 2s at 20 TPS
 const TIMEOUT_TICKS: u32 = 600; // 30s at 20 TPS
 const PEARL_PROXIMITY_SQR: f64 = 25.0; // 5 blocks
 
@@ -36,10 +35,11 @@ pub struct PearlBotState {
     pub success: Arc<AtomicBool>,
     pub ticks: Arc<AtomicU32>,
     pub clicked: Arc<AtomicBool>,
+    pub click_delay_ms: u64,
 }
 
 impl PearlBotState {
-    pub fn new(trapdoor: BlockPos, requester: String, done_tx: oneshot::Sender<bool>) -> Self {
+    pub fn new(trapdoor: BlockPos, requester: String, done_tx: oneshot::Sender<bool>, click_delay_ms: u64) -> Self {
         Self {
             trapdoor,
             requester,
@@ -49,6 +49,7 @@ impl PearlBotState {
             success: Arc::new(AtomicBool::new(false)),
             ticks: Arc::new(AtomicU32::new(0)),
             clicked: Arc::new(AtomicBool::new(false)),
+            click_delay_ms,
         }
     }
 
@@ -160,18 +161,16 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                     state.should_exit.load(Ordering::Relaxed));
             }
 
-            if ticks == CLICK_TICKS && !state.clicked.swap(true, Ordering::Relaxed) {
+            let pearl_id = state.pearl_entity_id.load(Ordering::Relaxed);
+            let elapsed_ms = ticks as u64 * 50;
+            if pearl_id >= 0 && elapsed_ms >= state.click_delay_ms && !state.clicked.swap(true, Ordering::Relaxed) {
                 let pos = bot.position();
                 let td = &state.trapdoor;
                 let reach_sqr = (pos.x - f64::from(td.x)).powi(2)
                     + (pos.y - f64::from(td.y)).powi(2)
                     + (pos.z - f64::from(td.z)).powi(2);
-                let pearl_id = state.pearl_entity_id.load(Ordering::Relaxed);
-                info!("[pearlbot] t=2.0s — sending UseItemOn trapdoor {:?} reach²={:.2} pearl_id={}",
-                    td, reach_sqr, pearl_id);
-                if pearl_id < 0 {
-                    warn!("[pearlbot] No pearl tracked yet at click time — may fail");
-                }
+                info!("[pearlbot] tick={} — sending UseItemOn trapdoor {:?} reach²={:.2} pearl_id={}",
+                    ticks, td, reach_sqr, pearl_id);
                 if reach_sqr > 25.0 {
                     warn!("[pearlbot] reach²={:.2} exceeds 25.0 — server will likely reject click", reach_sqr);
                 }
@@ -194,7 +193,6 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
             }
 
             if ticks >= TIMEOUT_TICKS && !state.should_exit.load(Ordering::Relaxed) {
-                let pearl_id = state.pearl_entity_id.load(Ordering::Relaxed);
                 warn!("[pearlbot] Timeout at 30s — pearl_id={} clicked={} for {}",
                     pearl_id, state.clicked.load(Ordering::Relaxed), state.requester);
                 state.should_exit.store(true, Ordering::Relaxed);
@@ -247,7 +245,7 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
 
     let (done_tx, done_rx) = oneshot::channel::<bool>();
     let trapdoor_pos = BlockPos::new(trapdoor[0], trapdoor[1], trapdoor[2]);
-    let state = PearlBotState::new(trapdoor_pos, requester.to_owned(), done_tx);
+    let state = PearlBotState::new(trapdoor_pos, requester.to_owned(), done_tx, slot.click_delay_ms);
 
     let server = slot.server.clone();
     let port = slot.port;

@@ -19,6 +19,8 @@ pub struct SlotConfig {
     #[serde(default = "default_port")]
     pub port: u16,
     #[serde(default)]
+    pub click_delay_ms: u64,
+    #[serde(default)]
     pub whitelist: Vec<String>,
     #[serde(default)]
     pub chambers: Vec<ChamberConfig>,
@@ -73,6 +75,7 @@ account = "your_alt_account"
 auth = "offline"   # or "microsoft"
 server = "play.refinedvanilla.net"
 port = 25565
+# click_delay_ms = 0   # optional: ms to wait after pearl detected before clicking (default 0)
 # UUIDs (not usernames) — copy from namemc.com or /data get entity @s UUID
 whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
 
