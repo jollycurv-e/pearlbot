@@ -26,6 +26,18 @@ use crate::config::{AuthMode, SlotConfig};
 const TIMEOUT_TICKS: u32 = 600; // 30s at 20 TPS
 const PEARL_PROXIMITY_SQR: f64 = 25.0; // 5 blocks
 
+fn dist_sq(pos: &Vec3, td: &BlockPos) -> f64 {
+    (pos.x - f64::from(td.x)).powi(2)
+        + (pos.y - f64::from(td.y)).powi(2)
+        + (pos.z - f64::from(td.z)).powi(2)
+}
+
+fn blockpos_to_vec3(bp: &BlockPos) -> Vec3 {
+    Vec3 { x: f64::from(bp.x), y: f64::from(bp.y), z: f64::from(bp.z) }
+}
+
+fn ticks_to_secs(ticks: u32) -> f32 { ticks as f32 / 20.0 }
+
 #[derive(Clone, Component, Default)]
 pub struct PearlBotState {
     pub trapdoor: BlockPos,
@@ -60,7 +72,9 @@ impl PearlBotState {
             if let Some(tx) = guard.take() {
                 let result = self.success.load(Ordering::Relaxed);
                 debug!("[pearlbot] sending done signal: {result}");
-                tx.send(result).ok();
+                if tx.send(result).is_err() {
+                    warn!("[pearlbot] signal_done: receiver dropped before send — result lost");
+                }
             } else {
                 debug!("[pearlbot] signal_done: already sent");
             }
@@ -70,19 +84,65 @@ impl PearlBotState {
     }
 }
 
+fn log_heartbeat(bot: &Client, state: &PearlBotState, ticks: u32, nearby_count: usize) {
+    let pos = bot.position();
+    info!("[pearlbot] t={:.1}s tick={} pos=({:.2},{:.2},{:.2}) nearby_pearls={} clicked={} should_exit={}",
+        ticks_to_secs(ticks), ticks, pos.x, pos.y, pos.z,
+        nearby_count,
+        state.clicked.load(Ordering::Relaxed),
+        state.should_exit.load(Ordering::Relaxed));
+}
+
+fn send_trapdoor_click(bot: &Client, state: &PearlBotState, ticks: u32, nearby_count: usize) {
+    let pos = bot.position();
+    let rsq = dist_sq(&pos, &state.trapdoor);
+    info!("[pearlbot] tick={} — sending UseItemOn trapdoor {:?} reach²={:.2} nearby_pearls={}",
+        ticks, &state.trapdoor, rsq, nearby_count);
+    if rsq > 25.0 {
+        warn!("[pearlbot] reach²={:.2} exceeds 25.0 — server will likely reject click", rsq);
+    }
+    let td_center = blockpos_to_vec3(&state.trapdoor);
+    bot.write_packet(ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        block_hit: BlockHit {
+            block_pos: state.trapdoor,
+            direction: Direction::Up,
+            location: Vec3 { x: td_center.x + 0.5, y: td_center.y + 1.0, z: td_center.z + 0.5 },
+            inside: false,
+            world_border: false,
+        },
+        seq: 0,
+    });
+    debug!("[pearlbot] UseItemOn packet sent");
+}
+
+fn check_timeout(state: &PearlBotState, ticks: u32, nearby_count: usize) {
+    if ticks >= TIMEOUT_TICKS && !state.should_exit.load(Ordering::Relaxed) {
+        warn!("[pearlbot] Timeout at 30s — nearby_pearls={} clicked={} for {}",
+            nearby_count, state.clicked.load(Ordering::Relaxed), state.requester);
+        state.should_exit.store(true, Ordering::Relaxed);
+    }
+}
+
+fn check_exit(bot: &Client, state: &PearlBotState, ticks: u32) {
+    if state.should_exit.load(Ordering::Relaxed) {
+        debug!("[pearlbot] Exiting at tick={} (~{:.1}s) success={}",
+            ticks, ticks_to_secs(ticks), state.success.load(Ordering::Relaxed));
+        state.signal_done();
+        bot.exit();
+    }
+}
+
 async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
     match event {
         Event::Spawn => {
             let pos = bot.position();
-            let td = &state.trapdoor;
-            let reach_sqr = (pos.x - f64::from(td.x)).powi(2)
-                + (pos.y - f64::from(td.y)).powi(2)
-                + (pos.z - f64::from(td.z)).powi(2);
+            let rsq = dist_sq(&pos, &state.trapdoor);
             info!("[pearlbot] Spawned at ({:.2},{:.2},{:.2}) — trapdoor {:?} reach²={:.2} for {}",
-                pos.x, pos.y, pos.z, td, reach_sqr, state.requester);
-            if reach_sqr > 25.0 {
+                pos.x, pos.y, pos.z, &state.trapdoor, rsq, state.requester);
+            if rsq > 25.0 {
                 warn!("[pearlbot] Bot is {:.1} blocks from trapdoor — server may reject click (max ~5 blocks)",
-                    reach_sqr.sqrt());
+                    rsq.sqrt());
             }
         }
 
@@ -96,14 +156,7 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                         return Ok(());
                     }
 
-                    let td = Vec3 {
-                        x: f64::from(state.trapdoor.x),
-                        y: f64::from(state.trapdoor.y),
-                        z: f64::from(state.trapdoor.z),
-                    };
-                    let dist_sqr = (pkt.position.x - td.x).powi(2)
-                        + (pkt.position.y - td.y).powi(2)
-                        + (pkt.position.z - td.z).powi(2);
+                    let dist_sqr = dist_sq(&pkt.position, &state.trapdoor);
                     info!("[pearlbot] EnderPearl id={} at ({:.2},{:.2},{:.2}) dist²={:.2} threshold={}",
                         pkt.id.0, pkt.position.x, pkt.position.y, pkt.position.z,
                         dist_sqr, PEARL_PROXIMITY_SQR);
@@ -136,7 +189,7 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                         if state.clicked.load(Ordering::Relaxed) {
                             let ticks = state.ticks.load(Ordering::Relaxed);
                             info!("[pearlbot] Pearl(s) {:?} despawned at tick={} (~{:.1}s) — success for {}",
-                                removed_nearby, ticks, ticks as f32 / 20.0, state.requester);
+                                removed_nearby, ticks, ticks_to_secs(ticks), state.requester);
                             state.success.store(true, Ordering::Relaxed);
                             state.should_exit.store(true, Ordering::Relaxed);
                         } else {
@@ -161,61 +214,19 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
 
         Event::Tick => {
             let ticks = state.ticks.fetch_add(1, Ordering::Relaxed) + 1;
-
             let nearby_count = state.nearby_pearls.lock().unwrap().len();
+
             if ticks % 20 == 0 {
-                let pos = bot.position();
-                let elapsed_s = ticks as f32 / 20.0;
-                info!("[pearlbot] t={:.1}s tick={} pos=({:.2},{:.2},{:.2}) nearby_pearls={} clicked={} should_exit={}",
-                    elapsed_s, ticks, pos.x, pos.y, pos.z,
-                    nearby_count,
-                    state.clicked.load(Ordering::Relaxed),
-                    state.should_exit.load(Ordering::Relaxed));
+                log_heartbeat(&bot, &state, ticks, nearby_count);
             }
 
             let elapsed_ms = ticks as u64 * 50;
             if nearby_count > 0 && elapsed_ms >= state.click_delay_ms && !state.clicked.swap(true, Ordering::Relaxed) {
-                let pos = bot.position();
-                let td = &state.trapdoor;
-                let reach_sqr = (pos.x - f64::from(td.x)).powi(2)
-                    + (pos.y - f64::from(td.y)).powi(2)
-                    + (pos.z - f64::from(td.z)).powi(2);
-                info!("[pearlbot] tick={} — sending UseItemOn trapdoor {:?} reach²={:.2} nearby_pearls={}",
-                    ticks, td, reach_sqr, nearby_count);
-                if reach_sqr > 25.0 {
-                    warn!("[pearlbot] reach²={:.2} exceeds 25.0 — server will likely reject click", reach_sqr);
-                }
-                bot.write_packet(ServerboundUseItemOn {
-                    hand: InteractionHand::MainHand,
-                    block_hit: BlockHit {
-                        block_pos: state.trapdoor,
-                        direction: Direction::Up,
-                        location: Vec3 {
-                            x: f64::from(state.trapdoor.x) + 0.5,
-                            y: f64::from(state.trapdoor.y) + 1.0,
-                            z: f64::from(state.trapdoor.z) + 0.5,
-                        },
-                        inside: false,
-                        world_border: false,
-                    },
-                    seq: 0,
-                });
-                debug!("[pearlbot] UseItemOn packet sent");
+                send_trapdoor_click(&bot, &state, ticks, nearby_count);
             }
 
-            if ticks >= TIMEOUT_TICKS && !state.should_exit.load(Ordering::Relaxed) {
-                warn!("[pearlbot] Timeout at 30s — nearby_pearls={} clicked={} for {}",
-                    nearby_count, state.clicked.load(Ordering::Relaxed), state.requester);
-                state.should_exit.store(true, Ordering::Relaxed);
-            }
-
-            if state.should_exit.load(Ordering::Relaxed) {
-                let ticks = state.ticks.load(Ordering::Relaxed);
-                debug!("[pearlbot] Exiting at tick={} (~{:.1}s) success={}",
-                    ticks, ticks as f32 / 20.0, state.success.load(Ordering::Relaxed));
-                state.signal_done();
-                bot.exit();
-            }
+            check_timeout(&state, ticks, nearby_count);
+            check_exit(&bot, &state, ticks);
         }
 
         Event::Disconnect(reason) => {
@@ -226,10 +237,10 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
             let success = state.success.load(Ordering::Relaxed);
             if success {
                 info!("[pearlbot] Disconnected at tick={} (~{:.1}s): {reason_str}",
-                    ticks, ticks as f32 / 20.0);
+                    ticks, ticks_to_secs(ticks));
             } else {
                 warn!("[pearlbot] Disconnected before completion at tick={} (~{:.1}s): {reason_str}",
-                    ticks, ticks as f32 / 20.0);
+                    ticks, ticks_to_secs(ticks));
             }
             state.signal_done();
         }
@@ -249,6 +260,38 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
     Ok(())
 }
 
+async fn resolve_account(auth: &AuthMode, name: &str) -> Result<Account> {
+    match auth {
+        AuthMode::Offline => {
+            debug!("[pearlbot] auth=offline account={}", name);
+            Ok(Account::offline(name))
+        }
+        AuthMode::Microsoft => {
+            let auth_start = Instant::now();
+            info!("[pearlbot] auth=microsoft — acquiring token for {}", name);
+            Ok(Account::microsoft(name).await
+                .inspect(|_| info!("[pearlbot] MS auth OK in {:.1}s", auth_start.elapsed().as_secs_f32()))
+                .inspect_err(|e| error!("[pearlbot] MS auth failed after {:.1}s: {e}", auth_start.elapsed().as_secs_f32()))?)
+        }
+    }
+}
+
+async fn run_mc_session(state: PearlBotState, auth: AuthMode, account_name: String, server: String, port: u16) {
+    let Ok(account) = resolve_account(&auth, &account_name).await else {
+        return;
+    };
+    let addr = format!("{server}:{port}");
+    info!("[pearlbot] connecting to {addr}");
+    let connect_start = Instant::now();
+    let exit_reason = ClientBuilder::new()
+        .set_handler(handle)
+        .set_state(state)
+        .start(account, addr.as_str())
+        .await;
+    info!("[pearlbot] Azalea client exited after {:.1}s: {:?}",
+        connect_start.elapsed().as_secs_f32(), exit_reason);
+}
+
 pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -> bool {
     let start = Instant::now();
     info!("[pearlbot] run_pearl start — requester={} trapdoor={:?} server={}:{}",
@@ -266,7 +309,7 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
 
     debug!("[pearlbot] spawning Azalea thread for account={}", account_name);
 
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("pearlbot-azalea".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
@@ -275,44 +318,14 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
                 .build()
                 .expect("tokio runtime")
                 .block_on(async move {
-                    let auth_start = Instant::now();
-                    let account = match auth {
-                        AuthMode::Offline => {
-                            debug!("[pearlbot] auth=offline account={}", account_name);
-                            Account::offline(&account_name)
-                        }
-                        AuthMode::Microsoft => {
-                            info!("[pearlbot] auth=microsoft — acquiring token for {}", account_name);
-                            match Account::microsoft(&account_name).await {
-                                Ok(a) => {
-                                    info!("[pearlbot] MS auth OK in {:.1}s", auth_start.elapsed().as_secs_f32());
-                                    a
-                                }
-                                Err(e) => {
-                                    error!("[pearlbot] MS auth failed after {:.1}s: {e}",
-                                        auth_start.elapsed().as_secs_f32());
-                                    state_clone.signal_done();
-                                    return;
-                                }
-                            }
-                        }
-                    };
-
-                    let addr = format!("{server}:{port}");
-                    info!("[pearlbot] connecting to {addr}");
-                    let connect_start = Instant::now();
-
-                    ClientBuilder::new()
-                        .set_handler(handle)
-                        .set_state(state_clone)
-                        .start(account, addr.as_str())
-                        .await;
-
-                    info!("[pearlbot] Azalea client exited after {:.1}s",
-                        connect_start.elapsed().as_secs_f32());
+                    run_mc_session(state_clone.clone(), auth, account_name, server, port).await;
+                    state_clone.signal_done();
                 });
         })
-        .expect("spawn azalea thread");
+    {
+        error!("[pearlbot] failed to spawn azalea thread: {e}");
+        return false;
+    }
 
     debug!("[pearlbot] waiting for done signal (outer timeout 60s)");
     let result = match tokio::time::timeout(std::time::Duration::from_secs(60), done_rx).await {

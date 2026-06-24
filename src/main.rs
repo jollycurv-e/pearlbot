@@ -12,6 +12,12 @@ use tracing::{debug, error, info, warn};
 
 const CONFIG_PATH: &str = "pearlbot.toml";
 
+fn reject(hub: &HubClient, slot: u8, requester: String, message: String) {
+    if let Err(e) = hub.send_pearl_result(PearlResult { slot, success: false, message, requester }) {
+        error!("Failed to send pearl rejection: {e}");
+    }
+}
+
 // Windows default stack is 1MB vs Linux's 8MB; Azalea needs more.
 fn main() -> Result<()> {
     std::thread::Builder::new()
@@ -82,36 +88,23 @@ async fn run() -> Result<()> {
 
                 let Some(slot) = slot_map.get(&req.slot) else {
                     warn!("Slot {} not configured — rejecting", req.slot);
-                    hub.send_pearl_result(PearlResult {
-                        slot: req.slot,
-                        success: false,
-                        message: format!("Slot {} is not configured", req.slot),
-                        requester: req.requester,
-                    }).ok();
+                    reject(&hub, req.slot, req.requester, format!("Slot {} is not configured", req.slot));
                     continue;
                 };
                 debug!("Slot {} found: server={} account={}", req.slot, slot.server, slot.account);
 
                 if !slot.is_whitelisted(&req.requester_uuid) {
                     warn!("{} ({}) not whitelisted for slot {}", req.requester, req.requester_uuid, req.slot);
-                    hub.send_pearl_result(PearlResult {
-                        slot: req.slot,
-                        success: false,
-                        message: format!("{} is not whitelisted", req.requester),
-                        requester: req.requester,
-                    }).ok();
+                    let msg = format!("{} is not whitelisted", req.requester);
+                    reject(&hub, req.slot, req.requester, msg);
                     continue;
                 }
                 debug!("{} ({}) is whitelisted", req.requester, req.requester_uuid);
 
                 let Some(trapdoor) = slot.find_trapdoor(&req.requester_uuid) else {
                     warn!("No chamber for {} ({}) on slot {}", req.requester, req.requester_uuid, req.slot);
-                    hub.send_pearl_result(PearlResult {
-                        slot: req.slot,
-                        success: false,
-                        message: format!("No chamber configured for {}", req.requester),
-                        requester: req.requester,
-                    }).ok();
+                    let msg = format!("No chamber configured for {}", req.requester);
+                    reject(&hub, req.slot, req.requester, msg);
                     continue;
                 };
                 debug!("Chamber found: trapdoor={:?}", trapdoor);
@@ -119,12 +112,7 @@ async fn run() -> Result<()> {
                 let slot_busy = busy.get(&req.slot).expect("slot in busy map");
                 if slot_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
                     warn!("Slot {} busy — rejecting {}", req.slot, req.requester);
-                    hub.send_pearl_result(PearlResult {
-                        slot: req.slot,
-                        success: false,
-                        message: format!("Slot {} is busy, try again shortly", req.slot),
-                        requester: req.requester,
-                    }).ok();
+                    reject(&hub, req.slot, req.requester, format!("Slot {} is busy, try again shortly", req.slot));
                     continue;
                 }
                 info!("Slot {} acquired — spawning pearl task for {} elapsed={:.1}ms",

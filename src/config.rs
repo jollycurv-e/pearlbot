@@ -2,6 +2,15 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McUuid(pub String);
+
+impl std::fmt::Display for McUuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub hub_url: String,
@@ -21,7 +30,7 @@ pub struct SlotConfig {
     #[serde(default)]
     pub click_delay_ms: u64,
     #[serde(default)]
-    pub whitelist: Vec<String>,
+    pub whitelist: Vec<McUuid>,
     #[serde(default)]
     pub chambers: Vec<ChamberConfig>,
 }
@@ -35,19 +44,19 @@ pub enum AuthMode {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ChamberConfig {
-    pub player: String,
+    pub player: McUuid,
     pub trapdoor: [i32; 3],
 }
 
 impl SlotConfig {
-    pub fn is_whitelisted(&self, uuid: &str) -> bool {
-        self.whitelist.iter().any(|w| w.eq_ignore_ascii_case(uuid))
+    pub fn is_whitelisted(&self, uuid: &McUuid) -> bool {
+        self.whitelist.iter().any(|w| w.0.eq_ignore_ascii_case(&uuid.0))
     }
 
-    pub fn find_trapdoor(&self, uuid: &str) -> Option<[i32; 3]> {
+    pub fn find_trapdoor(&self, uuid: &McUuid) -> Option<[i32; 3]> {
         self.chambers
             .iter()
-            .find(|c| c.player.eq_ignore_ascii_case(uuid))
+            .find(|c| c.player.0.eq_ignore_ascii_case(&uuid.0))
             .map(|c| c.trapdoor)
     }
 }

@@ -2,10 +2,6 @@ use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{Duration, interval, sleep};
@@ -14,6 +10,8 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
 };
 use tracing::{debug, info, warn, error};
+
+use crate::config::McUuid;
 
 #[derive(Debug, Clone, Deserialize)]
 struct InboundMessage {
@@ -31,7 +29,7 @@ struct OutboundMessage {
 pub struct PearlRequest {
     pub slot: u8,
     pub requester: String,
-    pub requester_uuid: String,
+    pub requester_uuid: McUuid,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,16 +53,12 @@ pub enum HubEvent {
 pub struct HubClient {
     sender: mpsc::UnboundedSender<Message>,
     events: broadcast::Sender<HubEvent>,
-    connected: Arc<AtomicBool>,
 }
 
 impl HubClient {
     pub async fn connect(url: String, api_key: String) -> Result<Self> {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Message>();
         let (events, _) = broadcast::channel(64);
-        let connected = Arc::new(AtomicBool::new(false));
-
-        let connected_for_task = connected.clone();
         let events_for_task = events.clone();
         let task_url = url.clone();
 
@@ -94,7 +88,6 @@ impl HubClient {
                         info!("[hub] connected in {:.1}ms — HTTP {}",
                             connect_start.elapsed().as_secs_f32() * 1000.0,
                             response.status());
-                        connected_for_task.store(true, Ordering::Relaxed);
                         events_for_task.send(HubEvent::Open).ok();
                         reconnect_count = 0;
 
@@ -132,6 +125,13 @@ impl HubClient {
                                         Some(Ok(Message::Text(text))) => {
                                             debug!("[hub] recv text ({} bytes): {}", text.len(), &text[..text.len().min(200)]);
                                             let event = parse_message(&text);
+                                            match &event {
+                                                HubEvent::PearlRequest(req) => info!("[hub] pearl_request: slot={} requester={} uuid={}", req.slot, req.requester, req.requester_uuid),
+                                                HubEvent::Open => info!("[hub] API key accepted"),
+                                                HubEvent::Error(e) => error!("[hub] message parse error: {e}"),
+                                                HubEvent::Unknown(_) => warn!("[hub] unrecognized or unparseable message"),
+                                                _ => {}
+                                            }
                                             events_for_task.send(event).ok();
                                         }
                                         Some(Ok(Message::Pong(_))) => {
@@ -163,12 +163,10 @@ impl HubClient {
                             }
                         }
 
-                        connected_for_task.store(false, Ordering::Relaxed);
                         info!("[hub] disconnected after {:.1}s total",
                             connect_start.elapsed().as_secs_f32());
                     }
                     Err(e) => {
-                        connected_for_task.store(false, Ordering::Relaxed);
                         error!("[hub] connect failed in {:.1}ms: {e}",
                             connect_start.elapsed().as_secs_f32() * 1000.0);
                         events_for_task.send(HubEvent::Error(e.to_string())).ok();
@@ -185,7 +183,7 @@ impl HubClient {
             }
         });
 
-        Ok(Self { sender, events, connected })
+        Ok(Self { sender, events })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<HubEvent> {
@@ -193,10 +191,6 @@ impl HubClient {
     }
 
     pub fn send_pearl_result(&self, result: PearlResult) -> Result<()> {
-        if !self.connected.load(Ordering::Relaxed) {
-            warn!("[hub] send_pearl_result called while disconnected");
-            return Err(anyhow!("not connected to Hub"));
-        }
         let payload = OutboundMessage {
             action: "pearl_result".to_owned(),
             data: serde_json::to_value(&result)?,
@@ -228,28 +222,14 @@ fn build_request(url: &str, api_key: &str) -> Result<tokio_tungstenite::tungsten
 
 fn parse_message(text: &str) -> HubEvent {
     let Ok(msg) = serde_json::from_str::<InboundMessage>(text) else {
-        warn!("[hub] failed to parse message: {}", &text[..text.len().min(200)]);
         return HubEvent::Unknown(text.to_owned());
     };
-    debug!("[hub] parsed action={}", msg.action);
     match msg.action.as_str() {
-        "pearl_request" => {
-            match serde_json::from_value::<PearlRequest>(msg.data) {
-                Ok(req) => {
-                    info!("[hub] pearl_request: slot={} requester={} uuid={}",
-                        req.slot, req.requester, req.requester_uuid);
-                    HubEvent::PearlRequest(req)
-                }
-                Err(e) => {
-                    error!("[hub] bad pearl_request payload: {e} — raw: {text}");
-                    HubEvent::Error(format!("bad pearl_request: {e}"))
-                }
-            }
-        }
-        "key-accepted" => {
-            info!("[hub] API key accepted");
-            HubEvent::Open
-        }
+        "pearl_request" => match serde_json::from_value::<PearlRequest>(msg.data) {
+            Ok(req) => HubEvent::PearlRequest(req),
+            Err(e) => HubEvent::Error(format!("bad pearl_request: {e}")),
+        },
+        "key-accepted" => HubEvent::Open,
         _ => HubEvent::Unknown(text.to_owned()),
     }
 }
