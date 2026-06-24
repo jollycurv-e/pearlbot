@@ -1,13 +1,14 @@
+use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::Instant;
 
 use anyhow::Result;
 use azalea::{
     BlockPos, Vec3,
-    core::{direction::Direction, entity_id::MinecraftEntityId},
+    core::direction::Direction,
     prelude::*,
     protocol::packets::game::{
         ClientboundGamePacket,
@@ -30,7 +31,7 @@ pub struct PearlBotState {
     pub trapdoor: BlockPos,
     pub requester: String,
     pub done_tx: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
-    pub pearl_entity_id: Arc<AtomicI32>,
+    pub nearby_pearls: Arc<Mutex<HashSet<i32>>>,
     pub should_exit: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
     pub ticks: Arc<AtomicU32>,
@@ -44,7 +45,7 @@ impl PearlBotState {
             trapdoor,
             requester,
             done_tx: Arc::new(Mutex::new(Some(done_tx))),
-            pearl_entity_id: Arc::new(AtomicI32::new(-1)),
+            nearby_pearls: Arc::new(Mutex::new(HashSet::new())),
             should_exit: Arc::new(AtomicBool::new(false)),
             success: Arc::new(AtomicBool::new(false)),
             ticks: Arc::new(AtomicU32::new(0)),
@@ -108,28 +109,38 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                         dist_sqr, PEARL_PROXIMITY_SQR);
 
                     if dist_sqr <= PEARL_PROXIMITY_SQR {
-                        let prev = state.pearl_entity_id.swap(pkt.id.0, Ordering::Relaxed);
-                        info!("[pearlbot] -> tracking pearl id={} (replaced prev={})", pkt.id.0, prev);
+                        let mut set = state.nearby_pearls.lock().unwrap();
+                        set.insert(pkt.id.0);
+                        info!("[pearlbot] -> tracking pearl id={} (nearby_pearls={})", pkt.id.0, set.len());
                     } else {
                         warn!("[pearlbot] -> pearl too far ({:.1} blocks), not tracking", dist_sqr.sqrt());
                     }
                 }
 
                 ClientboundGamePacket::RemoveEntities(pkt) => {
-                    let stored = state.pearl_entity_id.load(Ordering::Relaxed);
-                    debug!("[pearlbot] RemoveEntities: {:?} — tracking id={}",
-                        pkt.entity_ids.iter().map(|e| e.0).collect::<Vec<_>>(), stored);
+                    let removed_ids: Vec<i32> = pkt.entity_ids.iter().map(|e| e.0).collect();
+                    let mut set = state.nearby_pearls.lock().unwrap();
+                    let removed_nearby: Vec<i32> = removed_ids.iter()
+                        .filter(|id| set.contains(id))
+                        .copied()
+                        .collect();
 
-                    if stored >= 0 {
-                        let target = MinecraftEntityId(stored);
-                        if pkt.entity_ids.contains(&target) {
+                    debug!("[pearlbot] RemoveEntities: {:?} — tracking {:?}", removed_ids, set.iter().collect::<Vec<_>>());
+
+                    for id in &removed_nearby {
+                        set.remove(id);
+                    }
+                    drop(set);
+
+                    if !removed_nearby.is_empty() {
+                        if state.clicked.load(Ordering::Relaxed) {
                             let ticks = state.ticks.load(Ordering::Relaxed);
-                            info!("[pearlbot] Pearl id={} despawned at tick={} (~{:.1}s) — success for {}",
-                                stored, ticks, ticks as f32 / 20.0, state.requester);
+                            info!("[pearlbot] Pearl(s) {:?} despawned at tick={} (~{:.1}s) — success for {}",
+                                removed_nearby, ticks, ticks as f32 / 20.0, state.requester);
                             state.success.store(true, Ordering::Relaxed);
                             state.should_exit.store(true, Ordering::Relaxed);
                         } else {
-                            debug!("[pearlbot] RemoveEntities did not include tracked pearl id={}", stored);
+                            debug!("[pearlbot] Pearl(s) {:?} removed before click", removed_nearby);
                         }
                     }
                 }
@@ -151,26 +162,26 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
         Event::Tick => {
             let ticks = state.ticks.fetch_add(1, Ordering::Relaxed) + 1;
 
+            let nearby_count = state.nearby_pearls.lock().unwrap().len();
             if ticks % 20 == 0 {
                 let pos = bot.position();
                 let elapsed_s = ticks as f32 / 20.0;
-                info!("[pearlbot] t={:.1}s tick={} pos=({:.2},{:.2},{:.2}) pearl_id={} clicked={} should_exit={}",
+                info!("[pearlbot] t={:.1}s tick={} pos=({:.2},{:.2},{:.2}) nearby_pearls={} clicked={} should_exit={}",
                     elapsed_s, ticks, pos.x, pos.y, pos.z,
-                    state.pearl_entity_id.load(Ordering::Relaxed),
+                    nearby_count,
                     state.clicked.load(Ordering::Relaxed),
                     state.should_exit.load(Ordering::Relaxed));
             }
 
-            let pearl_id = state.pearl_entity_id.load(Ordering::Relaxed);
             let elapsed_ms = ticks as u64 * 50;
-            if pearl_id >= 0 && elapsed_ms >= state.click_delay_ms && !state.clicked.swap(true, Ordering::Relaxed) {
+            if nearby_count > 0 && elapsed_ms >= state.click_delay_ms && !state.clicked.swap(true, Ordering::Relaxed) {
                 let pos = bot.position();
                 let td = &state.trapdoor;
                 let reach_sqr = (pos.x - f64::from(td.x)).powi(2)
                     + (pos.y - f64::from(td.y)).powi(2)
                     + (pos.z - f64::from(td.z)).powi(2);
-                info!("[pearlbot] tick={} — sending UseItemOn trapdoor {:?} reach²={:.2} pearl_id={}",
-                    ticks, td, reach_sqr, pearl_id);
+                info!("[pearlbot] tick={} — sending UseItemOn trapdoor {:?} reach²={:.2} nearby_pearls={}",
+                    ticks, td, reach_sqr, nearby_count);
                 if reach_sqr > 25.0 {
                     warn!("[pearlbot] reach²={:.2} exceeds 25.0 — server will likely reject click", reach_sqr);
                 }
@@ -193,8 +204,8 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
             }
 
             if ticks >= TIMEOUT_TICKS && !state.should_exit.load(Ordering::Relaxed) {
-                warn!("[pearlbot] Timeout at 30s — pearl_id={} clicked={} for {}",
-                    pearl_id, state.clicked.load(Ordering::Relaxed), state.requester);
+                warn!("[pearlbot] Timeout at 30s — nearby_pearls={} clicked={} for {}",
+                    nearby_count, state.clicked.load(Ordering::Relaxed), state.requester);
                 state.should_exit.store(true, Ordering::Relaxed);
             }
 
