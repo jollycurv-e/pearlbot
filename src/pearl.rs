@@ -318,7 +318,13 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
                 .build()
                 .expect("tokio runtime")
                 .block_on(async move {
-                    run_mc_session(state_clone.clone(), auth, account_name, server, port).await;
+                    // Inner timeout slightly shorter than the outer 60s so the
+                    // Azalea future (and its pending async TCP/IO) is cancelled
+                    // before run_pearl returns, preventing zombie threads.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(50),
+                        run_mc_session(state_clone.clone(), auth, account_name, server, port),
+                    ).await;
                     state_clone.signal_done();
                 });
         })
