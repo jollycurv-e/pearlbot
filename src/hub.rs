@@ -129,7 +129,10 @@ impl HubClient {
                                                 HubEvent::PearlRequest(req) => info!("[hub] pearl_request: slot={} requester={} uuid={}", req.slot, req.requester, req.requester_uuid),
                                                 HubEvent::Open => info!("[hub] API key accepted"),
                                                 HubEvent::Error(e) => error!("[hub] message parse error: {e}"),
-                                                HubEvent::Unknown(_) => warn!("[hub] unrecognized or unparseable message"),
+                                                HubEvent::Unknown(msg) => {
+                                                    let preview = msg.chars().take(120).collect::<String>();
+                                                    debug!("[hub] ignoring unrelated websocket message: {preview}");
+                                                }
                                                 _ => {}
                                             }
                                             events_for_task.send(event).ok();
