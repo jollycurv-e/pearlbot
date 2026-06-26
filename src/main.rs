@@ -39,7 +39,11 @@ async fn run() -> Result<()> {
     config::write_example(CONFIG_PATH)?;
     let cfg = config::load(CONFIG_PATH)?;
 
-    info!("Loaded {} slot(s)", cfg.slots.len());
+    info!("Loaded {} slot(s) from {}", cfg.slots.len(), CONFIG_PATH);
+    for slot in &cfg.slots {
+        info!("Slot config: number={} server={} account={} auth={:?} click_delay_ms={} whitelist_count={}",
+            slot.number, slot.server, slot.account, slot.auth, slot.click_delay_ms, slot.whitelist.len());
+    }
 
     // Per-slot busy flag
     let busy: HashMap<u8, Arc<AtomicBool>> = cfg
@@ -111,12 +115,12 @@ async fn run() -> Result<()> {
 
                 let slot_busy = busy.get(&req.slot).expect("slot in busy map");
                 if slot_busy.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
-                    warn!("Slot {} busy — rejecting {}", req.slot, req.requester);
+                    warn!("Slot {} busy — rejecting {} (requester_uuid={})", req.slot, req.requester, req.requester_uuid);
                     reject(&hub, req.slot, req.requester, format!("Slot {} is busy, try again shortly", req.slot));
                     continue;
                 }
-                info!("Slot {} acquired — spawning pearl task for {} elapsed={:.1}ms",
-                    req.slot, req.requester, req_start.elapsed().as_secs_f32() * 1000.0);
+                info!("Slot {} acquired — spawning pearl task for {} elapsed={:.1}ms trapdoor={:?}",
+                    req.slot, req.requester, req_start.elapsed().as_secs_f32() * 1000.0, trapdoor);
 
                 let slot_clone = slot.clone();
                 let requester = req.requester.clone();
@@ -126,7 +130,7 @@ async fn run() -> Result<()> {
 
                 tokio::spawn(async move {
                     let task_start = Instant::now();
-                    debug!("Pearl task started for {requester} slot={slot_num}");
+                    info!("Pearl task started for requester={} slot={} account={} server={}", requester, slot_num, slot_clone.account, slot_clone.server);
 
                     let success = pearl::run_pearl(&slot_clone, &requester, trapdoor).await;
 

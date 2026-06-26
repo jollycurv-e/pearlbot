@@ -118,8 +118,8 @@ fn send_trapdoor_click(bot: &Client, state: &PearlBotState, ticks: u32, nearby_c
 
 fn check_timeout(state: &PearlBotState, ticks: u32, nearby_count: usize) {
     if ticks >= TIMEOUT_TICKS && !state.should_exit.load(Ordering::Relaxed) {
-        warn!("[pearlbot] Timeout at 30s — nearby_pearls={} clicked={} for {}",
-            nearby_count, state.clicked.load(Ordering::Relaxed), state.requester);
+        warn!("[pearlbot] Timeout at 30s — nearby_pearls={} clicked={} requester={} trapdoor={:?}",
+            nearby_count, state.clicked.load(Ordering::Relaxed), state.requester, state.trapdoor);
         state.should_exit.store(true, Ordering::Relaxed);
     }
 }
@@ -222,7 +222,14 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
 
             let elapsed_ms = ticks as u64 * 50;
             if nearby_count > 0 && elapsed_ms >= state.click_delay_ms && !state.clicked.swap(true, Ordering::Relaxed) {
+                info!("[pearlbot] attempting click at tick={} after {}ms (nearby_pearls={}) requester={}",
+                    ticks, elapsed_ms, nearby_count, state.requester);
                 send_trapdoor_click(&bot, &state, ticks, nearby_count);
+            } else if nearby_count == 0 {
+                debug!("[pearlbot] tick={} no nearby pearls yet; waiting requester={}", ticks, state.requester);
+            } else {
+                debug!("[pearlbot] tick={} click suppressed: nearby_pearls={} elapsed_ms={} click_delay_ms={} clicked={}",
+                    ticks, nearby_count, elapsed_ms, state.click_delay_ms, state.clicked.load(Ordering::Relaxed));
             }
 
             check_timeout(&state, ticks, nearby_count);
@@ -277,11 +284,13 @@ async fn resolve_account(auth: &AuthMode, name: &str) -> Result<Account> {
 }
 
 async fn run_mc_session(state: PearlBotState, auth: AuthMode, account_name: String, server: String, port: u16) {
+    info!("[pearlbot] resolving account account={} auth={:?} server={} port={}", account_name, auth, server, port);
     let Ok(account) = resolve_account(&auth, &account_name).await else {
+        error!("[pearlbot] account resolution failed for account={} auth={:?}", account_name, auth);
         return;
     };
     let addr = format!("{server}:{port}");
-    info!("[pearlbot] connecting to {addr}");
+    info!("[pearlbot] connecting to {addr} with account={} auth={:?}", account_name, auth);
     let connect_start = Instant::now();
     let exit_reason = ClientBuilder::new()
         .set_handler(handle)
@@ -294,8 +303,8 @@ async fn run_mc_session(state: PearlBotState, auth: AuthMode, account_name: Stri
 
 pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -> bool {
     let start = Instant::now();
-    info!("[pearlbot] run_pearl start — requester={} trapdoor={:?} server={}:{}",
-        requester, trapdoor, slot.server, slot.port);
+    info!("[pearlbot] run_pearl start — requester={} trapdoor={:?} server={}:{} account={} auth={:?} click_delay_ms={}",
+        requester, trapdoor, slot.server, slot.port, slot.account, slot.auth, slot.click_delay_ms);
 
     let (done_tx, done_rx) = oneshot::channel::<bool>();
     let trapdoor_pos = BlockPos::new(trapdoor[0], trapdoor[1], trapdoor[2]);

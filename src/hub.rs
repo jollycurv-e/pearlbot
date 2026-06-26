@@ -175,7 +175,8 @@ impl HubClient {
 
                 reconnect_count = reconnect_count.saturating_add(1);
                 let delay = if reconnect_count >= 5 { 60 } else { 5 };
-                warn!("[hub] reconnecting in {delay}s (attempt {reconnect_count})");
+                warn!("[hub] reconnecting in {delay}s (attempt {reconnect_count}) url={} api_key_present={}",
+                    task_url, !api_key.is_empty());
                 events_for_task.send(HubEvent::Close(format!(
                     "reconnecting in {delay}s (attempt {reconnect_count})"
                 ))).ok();
