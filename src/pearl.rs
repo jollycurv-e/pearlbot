@@ -134,6 +134,8 @@ fn check_exit(bot: &Client, state: &PearlBotState, ticks: u32) {
 }
 
 async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
+    debug!("[pearlbot] handle invoked with event: {:?}", std::mem::discriminant(&event));
+
     match event {
         Event::Spawn => {
             let pos = bot.position();
@@ -284,21 +286,28 @@ async fn resolve_account(auth: &AuthMode, name: &str) -> Result<Account> {
 }
 
 async fn run_mc_session(state: PearlBotState, auth: AuthMode, account_name: String, server: String, port: u16) {
+    info!("[pearlbot] entering run_mc_session");
     info!("[pearlbot] resolving account account={} auth={:?} server={} port={}", account_name, auth, server, port);
     let Ok(account) = resolve_account(&auth, &account_name).await else {
         error!("[pearlbot] account resolution failed for account={} auth={:?}", account_name, auth);
+        info!("[pearlbot] leaving run_mc_session (early return — account failure)");
         return;
     };
     let addr = format!("{server}:{port}");
     info!("[pearlbot] connecting to {addr} with account={} auth={:?}", account_name, auth);
     let connect_start = Instant::now();
+    
+    info!("[pearlbot] right before ClientBuilder::start()");
     let exit_reason = ClientBuilder::new()
         .set_handler(handle)
         .set_state(state)
         .start(account, addr.as_str())
         .await;
+    info!("[pearlbot] right after ClientBuilder::start()");
+
     info!("[pearlbot] Azalea client exited after {:.1}s: {:?}",
         connect_start.elapsed().as_secs_f32(), exit_reason);
+    info!("[pearlbot] leaving run_mc_session (normal exit)");
 }
 
 pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -> bool {
@@ -322,20 +331,38 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
         .name("pearlbot-azalea".to_owned())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime")
-                .block_on(async move {
-                    // Inner timeout slightly shorter than the outer 60s so the
-                    // Azalea future (and its pending async TCP/IO) is cancelled
-                    // before run_pearl returns, preventing zombie threads.
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(50),
-                        run_mc_session(state_clone.clone(), auth, account_name, server, port),
-                    ).await;
-                    state_clone.signal_done();
-                });
+            info!("[pearlbot] OS thread started");
+            
+            // Fix: Clone the state here so the closure takes this copy instead of the outer one
+            let inner_state = state_clone.clone();
+            
+            let runtime_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime")
+                    .block_on(async move {
+                        info!("[pearlbot] tokio runtime entered");
+                        
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(50),
+                            run_mc_session(inner_state, auth, account_name, server, port),
+                        ).await {
+                            Ok(_) => info!("[pearlbot] run_mc_session completed naturally within 50s"),
+                            Err(_) => warn!("[pearlbot] run_mc_session hit the 50s inner timeout limit!"),
+                        }
+                        
+                        info!("[pearlbot] tokio runtime leaving block_on");
+                    });
+            }));
+
+            if let Err(panic_err) = runtime_result {
+                error!("[pearlbot] OS thread caught a silent panic: {:?}", panic_err);
+            }
+
+            // state_clone is now perfectly safe to use here!
+            state_clone.signal_done();
+            info!("[pearlbot] OS thread exiting");
         })
     {
         error!("[pearlbot] failed to spawn azalea thread: {e}");
