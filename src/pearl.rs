@@ -333,11 +333,11 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
         .spawn(move || {
             info!("[pearlbot] OS thread started");
             
-            // Fix: Clone the state here so the closure takes this copy instead of the outer one
-            let inner_state = state_clone.clone();
+            let state_for_runtime = state_clone.clone();
             
             let runtime_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                tokio::runtime::Builder::new_current_thread()
+                // CHANGED: Upgraded to multi_thread to give Azalea's background tasks breathing room
+                tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .expect("tokio runtime")
@@ -346,7 +346,7 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
                         
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(50),
-                            run_mc_session(inner_state, auth, account_name, server, port),
+                            run_mc_session(state_for_runtime, auth, account_name, server, port),
                         ).await {
                             Ok(_) => info!("[pearlbot] run_mc_session completed naturally within 50s"),
                             Err(_) => warn!("[pearlbot] run_mc_session hit the 50s inner timeout limit!"),
@@ -360,7 +360,6 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
                 error!("[pearlbot] OS thread caught a silent panic: {:?}", panic_err);
             }
 
-            // state_clone is now perfectly safe to use here!
             state_clone.signal_done();
             info!("[pearlbot] OS thread exiting");
         })
