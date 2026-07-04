@@ -2,7 +2,6 @@
 .idea/
 .vscode/
 target/
-.artifacts/
 *.ps1
 pearlbot.toml
 CLAUDE.md

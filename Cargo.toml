@@ -1,73 +1,17 @@
 [package]
-name = "shaysbot"
-version = "0.17.1"
-authors = ["Shayne Hartford <shaybox@shaybox.com>"]
+name = "pearlbot"
+version = "0.1.0"
 edition = "2024"
-description = "My personal Minecraft bot using Azalea"
-readme = "README.md"
-homepage = "https://git.shaybox.com/shaysbot/releases/latest"
-repository = "https://github.com/ShayBox/ShaysBot"
-license = "MIT"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[patch.'https://github.com/azalea-rs/azalea']
-azalea = { git = "https://github.com/Shays-Forks/azalea" }
-#azalea = { path = "../azalea/azalea" }
-
-[patch.crates-io]
-ncr = { git = "https://github.com/Shays-Forks/ncr-rs", rev = "4004292" }
+description = "Stasis chamber activation bot for RefinedVanilla"
 
 [dependencies]
 anyhow = "1"
-azalea = { git = "https://github.com/azalea-rs/azalea", default-features = false, features = ["packet-event", "serde", "online-mode"] }
-azalea-viaversion = { git = "https://github.com/azalea-rs/azalea-viaversion", optional = true }
-#azalea-viaversion = { path = "../azalea-viaversion", optional = true }
-base64 = "0.22"
-bevy-discord = { version = "0.8", features = ["bot"], optional = true }
-bounded-counter = { version = "0.2", features = ["deref", "deref_mut"] }
-chrono = "0.4"
-derive_more = { version = "2", features = ["full"] }
-fastrand = "2"
-itertools = "0.14"
-lazy-regex = "3"
-ncr = { version = "0.1", features = ["cfb8", "ecb", "gcm"] }
-parking_lot = "0.12"
-semver = "1"
-serde = "1"
-serde_tuple = "1"
-serde_with = "3"
-serde_yml = "0.0.13"
-serenity = { version = "0.12", optional = true }
-smart-default = "0.7"
-str-macro = "1"
-strum = { version = "0.28", features = ["derive"] }
-terminal-link = "0.1"
-tiny_http = { version = "0.12", optional = true }
-tokio = { version = "1", features = ["full"] }
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "ddef37118448b639ff56b86ae339e8913cb4ed11" }
+futures-util = "0.3.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52.1", features = ["fs", "macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-ureq = { version = "3", features = ["json"] }
-uuid = "1"
-
-[features]
-default = ["api", "bot", "via"]
-api = ["dep:tiny_http"]
-bot = ["dep:bevy-discord", "dep:serenity"]
-via = ["dep:azalea-viaversion"]
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-multiple_crate_versions = "allow"
-needless_pass_by_value = "allow"
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(bevy_lint)"] }
-
-[profile.dev]
-opt-level = 1
-
-[profile.dev.package."*"]
-opt-level = 3
