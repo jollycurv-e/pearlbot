@@ -3,3 +3,9 @@
 .vscode/
 target/
 .artifacts/
+*.ps1
+pearlbot.toml
+CLAUDE.md
+build.log
+run.log
+pearlbot-viaproxy-integration.md
