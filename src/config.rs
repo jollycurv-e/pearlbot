@@ -33,6 +33,8 @@ pub struct SlotConfig {
     pub whitelist: Vec<McUuid>,
     #[serde(default)]
     pub chambers: Vec<ChamberConfig>,
+    #[serde(default)]
+    pub dispense_block: Option<[i32; 3]>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -87,6 +89,7 @@ port = 25565
 # click_delay_ms = 0   # optional: ms to wait after pearl detected before clicking (default 0)
 # UUIDs (not usernames) — copy from namemc.com or /data get entity @s UUID
 whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
+# dispense_block = [1234, 65, -5678]   # optional: button/lever clicked right after a successful catch, to re-arm the dropper
 
 [[slots.chambers]]
 player = "550e8400-e29b-41d4-a716-446655440000"

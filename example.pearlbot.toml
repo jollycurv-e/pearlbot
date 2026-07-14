@@ -9,6 +9,7 @@ server = "play.example.net"
 port = 25565
 # UUIDs only — not usernames. Get from namemc.com or /data get entity @s UUID in-game
 whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
+# dispense_block = [1234, 65, -5678]   # optional: button/lever clicked right after a successful catch, to re-arm the dropper
 
 [[slots.chambers]]
 player = "550e8400-e29b-41d4-a716-446655440000"

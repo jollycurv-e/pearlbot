@@ -41,6 +41,7 @@ fn ticks_to_secs(ticks: u32) -> f32 { ticks as f32 / 20.0 }
 #[derive(Clone, Component, Default)]
 pub struct PearlBotState {
     pub trapdoor: BlockPos,
+    pub dispense_block: Option<BlockPos>,
     pub requester: String,
     pub done_tx: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
     pub nearby_pearls: Arc<Mutex<HashSet<i32>>>,
@@ -52,9 +53,16 @@ pub struct PearlBotState {
 }
 
 impl PearlBotState {
-    pub fn new(trapdoor: BlockPos, requester: String, done_tx: oneshot::Sender<bool>, click_delay_ms: u64) -> Self {
+    pub fn new(
+        trapdoor: BlockPos,
+        dispense_block: Option<BlockPos>,
+        requester: String,
+        done_tx: oneshot::Sender<bool>,
+        click_delay_ms: u64,
+    ) -> Self {
         Self {
             trapdoor,
+            dispense_block,
             requester,
             done_tx: Arc::new(Mutex::new(Some(done_tx))),
             nearby_pearls: Arc::new(Mutex::new(HashSet::new())),
@@ -114,6 +122,23 @@ fn send_trapdoor_click(bot: &Client, state: &PearlBotState, ticks: u32, nearby_c
         seq: 0,
     });
     debug!("[pearlbot] UseItemOn packet sent");
+}
+
+fn send_dispense_click(bot: &Client, pos: &BlockPos) {
+    info!("[pearlbot] sending UseItemOn dispense_block {:?}", pos);
+    let center = blockpos_to_vec3(pos);
+    bot.write_packet(ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        block_hit: BlockHit {
+            block_pos: *pos,
+            direction: Direction::Up,
+            location: Vec3 { x: center.x + 0.5, y: center.y + 1.0, z: center.z + 0.5 },
+            inside: false,
+            world_border: false,
+        },
+        seq: 0,
+    });
+    debug!("[pearlbot] dispense_block UseItemOn packet sent");
 }
 
 fn check_timeout(state: &PearlBotState, ticks: u32, nearby_count: usize) {
@@ -193,6 +218,9 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                             info!("[pearlbot] Pearl(s) {:?} despawned at tick={} (~{:.1}s) — success for {}",
                                 removed_nearby, ticks, ticks_to_secs(ticks), state.requester);
                             state.success.store(true, Ordering::Relaxed);
+                            if let Some(dispense_block) = &state.dispense_block {
+                                send_dispense_click(&bot, dispense_block);
+                            }
                             state.should_exit.store(true, Ordering::Relaxed);
                         } else {
                             debug!("[pearlbot] Pearl(s) {:?} removed before click", removed_nearby);
@@ -317,7 +345,8 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
 
     let (done_tx, done_rx) = oneshot::channel::<bool>();
     let trapdoor_pos = BlockPos::new(trapdoor[0], trapdoor[1], trapdoor[2]);
-    let state = PearlBotState::new(trapdoor_pos, requester.to_owned(), done_tx, slot.click_delay_ms);
+    let dispense_block = slot.dispense_block.map(|p| BlockPos::new(p[0], p[1], p[2]));
+    let state = PearlBotState::new(trapdoor_pos, dispense_block, requester.to_owned(), done_tx, slot.click_delay_ms);
 
     let server = slot.server.clone();
     let port = slot.port;
