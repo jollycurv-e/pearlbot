@@ -25,6 +25,7 @@ use crate::config::{AuthMode, SlotConfig};
 
 const TIMEOUT_TICKS: u32 = 600; // 30s at 20 TPS
 const PEARL_PROXIMITY_SQR: f64 = 25.0; // 5 blocks
+const DISPENSE_RETRY_WAIT_TICKS: u32 = 20; // 1s at 20 TPS before retrying an unconfirmed dispense click
 
 fn dist_sq(pos: &Vec3, td: &BlockPos) -> f64 {
     (pos.x - f64::from(td.x)).powi(2)
@@ -50,6 +51,11 @@ pub struct PearlBotState {
     pub ticks: Arc<AtomicU32>,
     pub clicked: Arc<AtomicBool>,
     pub click_delay_ms: u64,
+    pub dispense_max_retries: u32,
+    pub dispense_pending: Arc<AtomicBool>,
+    pub dispense_confirmed: Arc<AtomicBool>,
+    pub dispense_attempts_left: Arc<AtomicU32>,
+    pub dispense_last_click_tick: Arc<AtomicU32>,
 }
 
 impl PearlBotState {
@@ -59,6 +65,7 @@ impl PearlBotState {
         requester: String,
         done_tx: oneshot::Sender<bool>,
         click_delay_ms: u64,
+        dispense_max_retries: u32,
     ) -> Self {
         Self {
             trapdoor,
@@ -71,6 +78,11 @@ impl PearlBotState {
             ticks: Arc::new(AtomicU32::new(0)),
             clicked: Arc::new(AtomicBool::new(false)),
             click_delay_ms,
+            dispense_max_retries,
+            dispense_pending: Arc::new(AtomicBool::new(false)),
+            dispense_confirmed: Arc::new(AtomicBool::new(false)),
+            dispense_attempts_left: Arc::new(AtomicU32::new(0)),
+            dispense_last_click_tick: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -179,6 +191,22 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                     debug!("[pearlbot] AddEntity: type={:?} id={} at ({:.1},{:.1},{:.1})",
                         pkt.entity_type, pkt.id.0, pkt.position.x, pkt.position.y, pkt.position.z);
 
+                    if pkt.entity_type == EntityKind::Item {
+                        if state.dispense_pending.load(Ordering::Relaxed) {
+                            if let Some(db) = &state.dispense_block {
+                                let dsq = dist_sq(&pkt.position, db);
+                                if dsq <= PEARL_PROXIMITY_SQR {
+                                    info!("[pearlbot] dispense confirmed — item id={} dist²={:.2} requester={}",
+                                        pkt.id.0, dsq, state.requester);
+                                    state.dispense_confirmed.store(true, Ordering::Relaxed);
+                                    state.dispense_pending.store(false, Ordering::Relaxed);
+                                    state.should_exit.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+
                     if pkt.entity_type != EntityKind::EnderPearl {
                         return Ok(());
                     }
@@ -219,9 +247,18 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
                                 removed_nearby, ticks, ticks_to_secs(ticks), state.requester);
                             state.success.store(true, Ordering::Relaxed);
                             if let Some(dispense_block) = &state.dispense_block {
+                                info!("[pearlbot] firing dispense click (attempt 1/{}) requester={}",
+                                    state.dispense_max_retries, state.requester);
                                 send_dispense_click(&bot, dispense_block);
+                                state.dispense_pending.store(true, Ordering::Relaxed);
+                                state.dispense_last_click_tick.store(state.ticks.load(Ordering::Relaxed), Ordering::Relaxed);
+                                state.dispense_attempts_left.store(
+                                    state.dispense_max_retries.saturating_sub(1),
+                                    Ordering::Relaxed,
+                                );
+                            } else {
+                                state.should_exit.store(true, Ordering::Relaxed);
                             }
-                            state.should_exit.store(true, Ordering::Relaxed);
                         } else {
                             debug!("[pearlbot] Pearl(s) {:?} removed before click", removed_nearby);
                         }
@@ -260,6 +297,27 @@ async fn handle(bot: Client, event: Event, state: PearlBotState) -> Result<()> {
             } else {
                 debug!("[pearlbot] tick={} click suppressed: nearby_pearls={} elapsed_ms={} click_delay_ms={} clicked={}",
                     ticks, nearby_count, elapsed_ms, state.click_delay_ms, state.clicked.load(Ordering::Relaxed));
+            }
+
+            if state.dispense_pending.load(Ordering::Relaxed) {
+                let last_click = state.dispense_last_click_tick.load(Ordering::Relaxed);
+                if ticks.saturating_sub(last_click) >= DISPENSE_RETRY_WAIT_TICKS {
+                    let attempts_left = state.dispense_attempts_left.load(Ordering::Relaxed);
+                    if attempts_left > 0 {
+                        if let Some(dispense_block) = &state.dispense_block {
+                            warn!("[pearlbot] dispense unconfirmed after {}t — retrying ({} attempt(s) left) requester={}",
+                                DISPENSE_RETRY_WAIT_TICKS, attempts_left, state.requester);
+                            send_dispense_click(&bot, dispense_block);
+                        }
+                        state.dispense_attempts_left.store(attempts_left - 1, Ordering::Relaxed);
+                        state.dispense_last_click_tick.store(ticks, Ordering::Relaxed);
+                    } else {
+                        warn!("[pearlbot] dispense never confirmed after {} attempts — giving up requester={}",
+                            state.dispense_max_retries, state.requester);
+                        state.dispense_pending.store(false, Ordering::Relaxed);
+                        state.should_exit.store(true, Ordering::Relaxed);
+                    }
+                }
             }
 
             check_timeout(&state, ticks, nearby_count);
@@ -346,7 +404,14 @@ pub async fn run_pearl(slot: &SlotConfig, requester: &str, trapdoor: [i32; 3]) -
     let (done_tx, done_rx) = oneshot::channel::<bool>();
     let trapdoor_pos = BlockPos::new(trapdoor[0], trapdoor[1], trapdoor[2]);
     let dispense_block = slot.dispense_block.map(|p| BlockPos::new(p[0], p[1], p[2]));
-    let state = PearlBotState::new(trapdoor_pos, dispense_block, requester.to_owned(), done_tx, slot.click_delay_ms);
+    let state = PearlBotState::new(
+        trapdoor_pos,
+        dispense_block,
+        requester.to_owned(),
+        done_tx,
+        slot.click_delay_ms,
+        slot.dispense_max_retries,
+    );
 
     let server = slot.server.clone();
     let port = slot.port;

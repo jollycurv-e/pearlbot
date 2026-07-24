@@ -35,6 +35,8 @@ pub struct SlotConfig {
     pub chambers: Vec<ChamberConfig>,
     #[serde(default)]
     pub dispense_block: Option<[i32; 3]>,
+    #[serde(default = "default_dispense_max_retries")]
+    pub dispense_max_retries: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -67,6 +69,10 @@ fn default_port() -> u16 {
     25565
 }
 
+fn default_dispense_max_retries() -> u32 {
+    3
+}
+
 pub fn load(path: &str) -> Result<Config> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading {path}"))?;
@@ -90,6 +96,7 @@ port = 25565
 # UUIDs (not usernames) — copy from namemc.com or /data get entity @s UUID
 whitelist = ["550e8400-e29b-41d4-a716-446655440000"]
 # dispense_block = [1234, 65, -5678]   # optional: button/lever clicked right after a successful catch, to re-arm the dropper
+# dispense_max_retries = 3   # optional: re-click the button this many times if no item entity confirms the dropper fired (default 3)
 
 [[slots.chambers]]
 player = "550e8400-e29b-41d4-a716-446655440000"
